@@ -1,106 +1,113 @@
 `timescale 1ns / 1ps
 (* keep_hierarchy = "yes", dont_touch = "yes" *)
+//
+// batch_buffer.v  -- ping-pong double buffer (improvement #6)
+//
+// One bank fills from DMA while the other is consumed by the loader.
+// The refill latency is completely hidden behind compute time.
+//
+// Protocol (unchanged from original single-buffer interface):
+//   in_valid / in_byte / mode_sel  → producer push path
+//   in_ready                       → backpressure to producer
+//   consume                        → consumer signals "done reading"
+//   flat_out / batch_ready         → consumer pull path
+//
 module batch_buffer #(
-    parameter NUM_ELEMS = 256   // logical elements (bytes for INT8, nibbles for INT4)
+    parameter NUM_ELEMS = 256
 )(
     input  wire                     clk,
     input  wire                     resetn,
 
     input  wire                     in_valid,
-    input  wire [7:0]               in_byte,     // full byte (INT8) or nibble (INT4: use [3:0])
-    input  wire [1:0]               mode_sel,    // 00 = INT8, 01 = INT4
+    input  wire [7:0]               in_byte,
+    input  wire [1:0]               mode_sel,
 
     output wire                     in_ready,
     input  wire                     consume,
 
-    // IMPORTANT: loader expects NUM_ELEMS bytes aligned in flat_out
     output reg  [NUM_ELEMS*8-1:0]   flat_out,
     output reg                      batch_ready
 );
 
-    // Logical element counter
     localparam CNTW = $clog2(NUM_ELEMS + 1);
-    reg [CNTW-1:0] cnt;
 
-    // INT4 packing registers
-    reg            half_toggle;    // 0 = waiting low nibble, 1 = waiting high nibble
-    reg [3:0]      low_nib;        // holds previous low nibble when packing
+    // Two buffer banks
+    reg [NUM_ELEMS*8-1:0] bank_data [0:1];
+    reg [CNTW-1:0]        bank_cnt  [0:1];   // fill count
+    reg                   bank_full [0:1];   // complete batch flag
+    reg                   half_tog  [0:1];   // INT4 nibble packing state
+    reg [3:0]             low_nib   [0:1];   // saved low nibble (INT4)
+
+    reg fill_sel;   // which bank the producer is currently filling
 
     integer byte_idx;
 
-    // Can accept new data while we still have space for logical elements
-    assign in_ready = (cnt < NUM_ELEMS);
+    // Producer may push when the fill bank still has room
+    assign in_ready = (bank_cnt[fill_sel] < NUM_ELEMS);
 
     always @(posedge clk) begin
         if (!resetn) begin
-            flat_out    <= {NUM_ELEMS*8{1'b0}};
-            cnt         <= 0;
-            batch_ready <= 0;
-            half_toggle <= 0;
-            low_nib     <= 4'd0;
+            fill_sel        <= 1'b0;
+            bank_cnt[0]     <= 0;       bank_cnt[1]     <= 0;
+            bank_full[0]    <= 1'b0;    bank_full[1]    <= 1'b0;
+            half_tog[0]     <= 1'b0;    half_tog[1]     <= 1'b0;
+            low_nib[0]      <= 4'd0;    low_nib[1]      <= 4'd0;
+            bank_data[0]    <= {NUM_ELEMS*8{1'b0}};
+            bank_data[1]    <= {NUM_ELEMS*8{1'b0}};
+            flat_out        <= {NUM_ELEMS*8{1'b0}};
+            batch_ready     <= 1'b0;
         end else begin
 
-            // If a full batch is ready, wait for consume
-            if (batch_ready) begin
-                if (consume) begin
-                    // Reset for new batch
-                    cnt         <= 0;
-                    batch_ready <= 0;
-                    half_toggle <= 0;
-                    low_nib     <= 4'd0;
-                    // No need to clear flat_out (loader overwrites everything)
-                end
+            // --- Consumer: release read bank on consume ---
+            // Read bank is always bank[!fill_sel]
+            if (consume && bank_full[!fill_sel]) begin
+                bank_full[!fill_sel] <= 1'b0;
+                bank_cnt[!fill_sel]  <= 0;
+                half_tog[!fill_sel]  <= 1'b0;
+                low_nib[!fill_sel]   <= 4'd0;
             end
 
-            // Normal operation
-            else if (in_valid && in_ready) begin
-
-                //---------------------------
-                // INT4 MODE (mode_sel == 01)
-                //---------------------------
+            // --- Producer: write one byte into fill bank ---
+            if (in_valid && (bank_cnt[fill_sel] < NUM_ELEMS)) begin
                 if (mode_sel == 2'b01) begin
-                    byte_idx = (cnt >> 1);  // 2 logical elems per output byte
-
-                    if (!half_toggle) begin
-                        // Capture low nibble, wait for next nibble
-                        low_nib     <= in_byte[3:0];
-                        half_toggle <= 1'b1;
-                        cnt         <= cnt + 1;
-
-                        // If NUM_ELEMS is odd and this was the very last nibble
-                        if (cnt + 1 == NUM_ELEMS) begin
-                            // Store {high=0, low=low_nib}
-                            flat_out[(byte_idx+1)*8-1 -: 8] <= {4'd0, in_byte[3:0]};
-                            batch_ready <= 1'b1;
+                    // INT4: pack two nibbles per byte slot
+                    byte_idx = (bank_cnt[fill_sel] >> 1);
+                    if (!half_tog[fill_sel]) begin
+                        low_nib[fill_sel]  <= in_byte[3:0];
+                        half_tog[fill_sel] <= 1'b1;
+                        bank_cnt[fill_sel] <= bank_cnt[fill_sel] + 1;
+                        if (bank_cnt[fill_sel] + 1 == NUM_ELEMS) begin
+                            // odd final element: store low nibble only
+                            bank_data[fill_sel][(byte_idx+1)*8-1 -: 8] <=
+                                {4'd0, in_byte[3:0]};
+                            bank_full[fill_sel] <= 1'b1;
                         end
-
                     end else begin
-                        // We have low_nib from before; now place high nibble
-                        flat_out[(byte_idx+1)*8-1 -: 8] <= {in_byte[3:0], low_nib};
-
-                        half_toggle <= 1'b0;
-                        cnt         <= cnt + 1;
-
-                        if (cnt + 1 == NUM_ELEMS)
-                            batch_ready <= 1'b1;
+                        bank_data[fill_sel][(byte_idx+1)*8-1 -: 8] <=
+                            {in_byte[3:0], low_nib[fill_sel]};
+                        half_tog[fill_sel] <= 1'b0;
+                        bank_cnt[fill_sel] <= bank_cnt[fill_sel] + 1;
+                        if (bank_cnt[fill_sel] + 1 == NUM_ELEMS)
+                            bank_full[fill_sel] <= 1'b1;
                     end
-                end
-
-                //---------------------------
-                // INT8 MODE (mode_sel != 01)
-                //---------------------------
-                else begin
-                    byte_idx = cnt;
-
-                    // Store 1 byte per logical element
-                    flat_out[(byte_idx+1)*8-1 -: 8] <= in_byte;
-
-                    cnt <= cnt + 1;
-
-                    if (cnt + 1 == NUM_ELEMS)
-                        batch_ready <= 1'b1;
+                end else begin
+                    // INT8 (also INT2: raw bytes)
+                    byte_idx = bank_cnt[fill_sel];
+                    bank_data[fill_sel][(byte_idx+1)*8-1 -: 8] <= in_byte;
+                    bank_cnt[fill_sel] <= bank_cnt[fill_sel] + 1;
+                    if (bank_cnt[fill_sel] + 1 == NUM_ELEMS)
+                        bank_full[fill_sel] <= 1'b1;
                 end
             end
+
+            // --- Switch fill bank when full and read bank is free ---
+            // (read bank freed on the consume cycle or already empty)
+            if (bank_full[fill_sel] && !bank_full[!fill_sel])
+                fill_sel <= !fill_sel;
+
+            // --- Update outputs: expose the current read bank ---
+            flat_out    <= bank_data[!fill_sel];
+            batch_ready <= bank_full[!fill_sel];
         end
     end
 

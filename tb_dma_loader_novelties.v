@@ -36,6 +36,7 @@ module tb_dma_loader_novelties;
     reg  [3:0]              shift;
 
     wire signed [31:0]      mac_result;
+    wire [16*32-1:0]        mac_result_vec;  // per-row results (new; not checked here)
 
     // ---------------- DUTs ----------------
 
@@ -81,7 +82,13 @@ module tb_dma_loader_novelties;
         .bias(bias),
         .scale(scale),
         .shift(shift),
+        // New systolic ports: tied off for SIMD testbench
+        .a_row_in({16*ELEM_BITS{1'b0}}),
+        .b_col_in({16*ELEM_BITS{1'b0}}),
+        .systolic_en(1'b0),
+        .acc_clear(1'b0),
         .result(mac_result),
+        .result_vec(mac_result_vec),
         .pe_busy(pe_busy)
     );
 

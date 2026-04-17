@@ -27,6 +27,7 @@ module tb_mac_array_mem;
     reg  [3:0]          shift;
 
     wire signed [31:0]  result;
+    wire [16*32-1:0]    result_vec;  // per-row results (ROWS=16; new; not checked here)
     wire [NUM_PES-1:0]  pe_busy;
 
     // simple perf counters
@@ -68,7 +69,13 @@ module tb_mac_array_mem;
         .bias(bias),
         .scale(scale),
         .shift(shift),
+        // New systolic ports: tied off for SIMD testbench
+        .a_row_in({16*ELEM_BITS{1'b0}}),
+        .b_col_in({16*ELEM_BITS{1'b0}}),
+        .systolic_en(1'b0),
+        .acc_clear(1'b0),
         .result(result),
+        .result_vec(result_vec),
         .pe_busy(pe_busy)
     );
 

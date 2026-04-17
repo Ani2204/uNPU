@@ -21,7 +21,15 @@ module mac_array #(
     input  wire signed [31:0]       bias,
     input  wire [3:0]               scale,
     input  wire [3:0]               shift,
+    // Systolic mode inputs (improvement #4): one A per row, one B per column
+    input  wire [ROWS*WIDTH-1:0]    a_row_in,
+    input  wire [COLS*WIDTH-1:0]    b_col_in,
+    input  wire                     systolic_en,
+    input  wire                     acc_clear,
+    // Legacy global-sum result (backward-compatible with testbenches)
     output reg  signed [31:0]       result,
+    // Per-row results after post-processing (improvement #3)
+    output reg  signed [ROWS*32-1:0] result_vec,
     output reg  [NUM_PES-1:0]       pe_busy
 );
 
@@ -111,6 +119,18 @@ module mac_array #(
 
     wire signed [ACC_WIDTH-1:0] tile_sum0, tile_sum1, tile_sum2, tile_sum3;
     wire [T_PES-1:0] tile_busy0, tile_busy1, tile_busy2, tile_busy3;
+    // Per-row sums from each tile (TILE_ROWS sums per tile)
+    wire signed [TILE_ROWS*ACC_WIDTH-1:0] tile_rs0, tile_rs1, tile_rs2, tile_rs3;
+
+    // Systolic row/column slices per tile
+    // top tiles (0,1): rows 0..TILE_ROWS-1  → a_row_in[0..TILE_ROWS-1]
+    // bottom tiles (2,3): rows TILE_ROWS..ROWS-1 → a_row_in[TILE_ROWS..ROWS-1]
+    // left tiles (0,2): cols 0..TILE_COLS-1  → b_col_in[0..TILE_COLS-1]
+    // right tiles (1,3): cols TILE_COLS..COLS-1 → b_col_in[TILE_COLS..COLS-1]
+    wire [TILE_ROWS*WIDTH-1:0] a_top   = a_row_in[TILE_ROWS*WIDTH-1:0];
+    wire [TILE_ROWS*WIDTH-1:0] a_bot   = a_row_in[ROWS*WIDTH-1:TILE_ROWS*WIDTH];
+    wire [TILE_COLS*WIDTH-1:0] b_left  = b_col_in[TILE_COLS*WIDTH-1:0];
+    wire [TILE_COLS*WIDTH-1:0] b_right = b_col_in[COLS*WIDTH-1:TILE_COLS*WIDTH];
 
     (* keep_hierarchy = "yes", dont_touch = "yes" *)
     mac_tile_8x8 #(.WIDTH(WIDTH), .ACC_WIDTH(ACC_WIDTH), .ROWS(TILE_ROWS), .COLS(TILE_COLS), .NUM_PES(T_PES), .PE_LATENCY(PE_LATENCY))
@@ -120,8 +140,11 @@ module mac_array #(
             .msb_stat_thres(msb_stat_thres),
             .gate_en(gate_tile0),
             .A_flat(A_tile0), .B_flat(B_tile0),
+            .a_row_in(a_top), .b_col_in(b_left),
+            .systolic_en(systolic_en), .acc_clear(acc_clear),
             .pe_busy(tile_busy0),
-            .tile_sum(tile_sum0)
+            .tile_sum(tile_sum0),
+            .tile_row_sums(tile_rs0)
         );
 
     (* keep_hierarchy = "yes", dont_touch = "yes" *)
@@ -132,8 +155,11 @@ module mac_array #(
             .msb_stat_thres(msb_stat_thres),
             .gate_en(gate_tile1),
             .A_flat(A_tile1), .B_flat(B_tile1),
+            .a_row_in(a_top), .b_col_in(b_right),
+            .systolic_en(systolic_en), .acc_clear(acc_clear),
             .pe_busy(tile_busy1),
-            .tile_sum(tile_sum1)
+            .tile_sum(tile_sum1),
+            .tile_row_sums(tile_rs1)
         );
 
     (* keep_hierarchy = "yes", dont_touch = "yes" *)
@@ -144,8 +170,11 @@ module mac_array #(
             .msb_stat_thres(msb_stat_thres),
             .gate_en(gate_tile2),
             .A_flat(A_tile2), .B_flat(B_tile2),
+            .a_row_in(a_bot), .b_col_in(b_left),
+            .systolic_en(systolic_en), .acc_clear(acc_clear),
             .pe_busy(tile_busy2),
-            .tile_sum(tile_sum2)
+            .tile_sum(tile_sum2),
+            .tile_row_sums(tile_rs2)
         );
 
     (* keep_hierarchy = "yes", dont_touch = "yes" *)
@@ -156,8 +185,11 @@ module mac_array #(
             .msb_stat_thres(msb_stat_thres),
             .gate_en(gate_tile3),
             .A_flat(A_tile3), .B_flat(B_tile3),
+            .a_row_in(a_bot), .b_col_in(b_right),
+            .systolic_en(systolic_en), .acc_clear(acc_clear),
             .pe_busy(tile_busy3),
-            .tile_sum(tile_sum3)
+            .tile_sum(tile_sum3),
+            .tile_row_sums(tile_rs3)
         );
 
     integer gi;
@@ -207,7 +239,7 @@ module mac_array #(
         end
     end
 
-    // Combine tile sums
+    // Combine tile sums for legacy global-sum output
     reg signed [ACC_WIDTH-1:0] sum01, sum23, total_sum;
     always @(posedge clk) begin
         if (!resetn) begin
@@ -221,7 +253,7 @@ module mac_array #(
         end
     end
 
-    // Fixed accumulator (fuse) - sequential, no combinational feedback
+    // Fuse accumulator for global result (legacy backward-compat)
     reg signed [ACC_WIDTH-1:0] acc;
     always @(posedge clk) begin
         if (!resetn) begin
@@ -232,28 +264,98 @@ module mac_array #(
         end
     end
 
-    // final combinational convert (safe to keep combinational)
-    reg signed [63:0] tmp64;
-    reg signed [31:0] tmp32;
-    always @(*) begin
-        // bias sign-extend to ACC_WIDTH then to 64-bit tmp64
-        tmp64 = {{(64-ACC_WIDTH){acc[ACC_WIDTH-1]}}, acc[ACC_WIDTH-1:0]}; // extend acc to 64
-        tmp64 = tmp64 + {{(64-32){bias[31]}}, bias};
-        // multiply by scale (scale is small unsigned)
-        tmp64 = tmp64 * {{(64-4){1'b0}}, scale};
-        // arithmetic right shift by shift
-        tmp64 = tmp64 >>> shift;
-        // saturate to 32-bit signed
-        if (tmp64 > 64'sh7FFF_FFFF) tmp32 = 32'sh7FFF_FFFF;
-        else if (tmp64 < -64'sh80000000) tmp32 = -32'sh80000000;
-        else tmp32 = tmp64[31:0];
-        if (relu_en && tmp32[31]) tmp32 = 32'sd0; // if negative, zero-out
+    // ------------------------------------------------------------------
+    // Post-processing pipeline (improvement #9): 3 stages
+    // Stage 1: bias add
+    // Stage 2: scale multiply + arithmetic shift
+    // Stage 3: saturate to 32-bit, apply ReLU, register result
+    // ------------------------------------------------------------------
+
+    // ---- LEGACY global result ----
+    reg signed [63:0] pp1_val;
+    reg signed [63:0] pp2_val;
+    always @(posedge clk) begin
+        if (!resetn) begin
+            pp1_val <= 64'sd0;
+            pp2_val <= 64'sd0;
+            result  <= 32'sd0;
+        end else begin
+            // Stage 1: bias add (sign-extend acc and bias to 64 bits)
+            pp1_val <= {{(64-ACC_WIDTH){acc[ACC_WIDTH-1]}}, acc} +
+                       {{32{bias[31]}}, bias};
+            // Stage 2: scale × pp1 then arithmetic right-shift
+            pp2_val <= (pp1_val * {{60{1'b0}}, scale}) >>> shift;
+            // Stage 3: saturate and ReLU
+            if      (pp2_val > 64'sh7FFF_FFFF) result <= 32'sh7FFF_FFFF;
+            else if (pp2_val < -64'sh80000000) result <= -32'sh80000000;
+            else                               result <= pp2_val[31:0];
+            if (relu_en && pp2_val[63])        result <= 32'sd0;
+        end
     end
 
-    // register result
+    // ------------------------------------------------------------------
+    // Per-row K-accumulators and per-row pipelined post-processing
+    // (improvement #3 + #9)
+    // Tile row sums: tile_rs0/1 hold TILE_ROWS sums each for top rows
+    //               tile_rs2/3 hold TILE_ROWS sums each for bottom rows
+    // Row r (0..ROWS-1) sum = left-tile + right-tile row-sum.
+    // ------------------------------------------------------------------
+    reg signed [ACC_WIDTH-1:0] row_sum  [0:ROWS-1];   // assembled across tiles
+    reg signed [ACC_WIDTH-1:0] row_acc  [0:ROWS-1];   // K-accumulation per row
+    // Pipeline registers per row
+    reg signed [63:0] row_pp1 [0:ROWS-1]; // stage 1: bias add
+    reg signed [63:0] row_pp2 [0:ROWS-1]; // stage 2: scale+shift
+    reg signed [31:0] row_pp3 [0:ROWS-1]; // stage 3: saturate+ReLU
+
+    integer row_i;
     always @(posedge clk) begin
-        if (!resetn) result <= 32'sd0;
-        else result <= tmp32;
+        if (!resetn || acc_clear) begin
+            for (row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
+                row_sum [row_i] <= {ACC_WIDTH{1'b0}};
+                row_acc [row_i] <= {ACC_WIDTH{1'b0}};
+                row_pp1 [row_i] <= 64'sd0;
+                row_pp2 [row_i] <= 64'sd0;
+                row_pp3 [row_i] <= 32'sd0;
+            end
+            result_vec <= {ROWS*32{1'b0}};
+        end else begin
+            // Step 1: assemble per-row sums across left and right tiles
+            for (row_i = 0; row_i < TILE_ROWS; row_i = row_i + 1) begin
+                // Top rows: tile0 (left) + tile1 (right)
+                row_sum[row_i] <=
+                    tile_rs0[(row_i+1)*ACC_WIDTH-1 -: ACC_WIDTH] +
+                    tile_rs1[(row_i+1)*ACC_WIDTH-1 -: ACC_WIDTH];
+                // Bottom rows: tile2 (left) + tile3 (right)
+                row_sum[TILE_ROWS + row_i] <=
+                    tile_rs2[(row_i+1)*ACC_WIDTH-1 -: ACC_WIDTH] +
+                    tile_rs3[(row_i+1)*ACC_WIDTH-1 -: ACC_WIDTH];
+            end
+
+            // Step 2: K-accumulation per row
+            for (row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
+                if (fuse_en) row_acc[row_i] <= row_acc[row_i] + row_sum[row_i];
+                else         row_acc[row_i] <= row_sum[row_i];
+            end
+
+            // Step 3a (stage 1): bias add per row
+            for (row_i = 0; row_i < ROWS; row_i = row_i + 1)
+                row_pp1[row_i] <=
+                    {{(64-ACC_WIDTH){row_acc[row_i][ACC_WIDTH-1]}}, row_acc[row_i]} +
+                    {{32{bias[31]}}, bias};
+
+            // Step 3b (stage 2): scale × pp1 + arithmetic shift per row
+            for (row_i = 0; row_i < ROWS; row_i = row_i + 1)
+                row_pp2[row_i] <= (row_pp1[row_i] * {{60{1'b0}}, scale}) >>> shift;
+
+            // Step 3c (stage 3): saturate + ReLU, register into result_vec
+            for (row_i = 0; row_i < ROWS; row_i = row_i + 1) begin
+                if      (row_pp2[row_i] > 64'sh7FFF_FFFF) row_pp3[row_i] = 32'sh7FFF_FFFF;
+                else if (row_pp2[row_i] < -64'sh80000000) row_pp3[row_i] = -32'sh80000000;
+                else                                       row_pp3[row_i] = row_pp2[row_i][31:0];
+                if (relu_en && row_pp2[row_i][63])         row_pp3[row_i] = 32'sd0;
+                result_vec[(row_i+1)*32-1 -: 32] <= row_pp3[row_i];
+            end
+        end
     end
 
 endmodule
