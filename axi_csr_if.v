@@ -258,7 +258,11 @@ module axi_csr_if #(
                     12'h040: if (wstrb_reg[0]) systolic_en  <= wdata_reg[0];
                     12'h044: if (wstrb_reg[0]) acc_clear    <= wdata_reg[0]; // one-cycle pulse
                     12'h060: begin
-                        // Build dma_ctrl in one assignment; bit [2] overrides to INT4 flag
+                        // Build dma_ctrl in a single assignment.
+                        // Bit [2] is the INT4-mode flag and is derived from
+                        // mode_sel (2'b01 = INT4) rather than from wdata_reg[2],
+                        // so that the DMA engine always tracks the current
+                        // quantisation mode without requiring a separate write.
                         dma_ctrl <= {wdata_reg[31:3], (mode_sel == 2'b01), wdata_reg[1:0]};
                     end
                     12'h064: dma_addr <= wdata_reg;

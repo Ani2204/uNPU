@@ -52,6 +52,11 @@ module dma_bram #(
 
     // DMA FSM
     localparam IDLE = 2'b00, BUSY = 2'b01, DONE = 2'b10;
+    // dma_status encoding: bit[31]=error, bits[1:0]=state code (1=BUSY, 2=DONE)
+    localparam STATUS_IDLE  = 32'd0;
+    localparam STATUS_BUSY  = 32'd1;
+    localparam STATUS_DONE  = 32'd2;
+    localparam STATUS_ERR   = 32'h8000_0000;
     reg [1:0] st;
 
     // Separate A/B stream state
@@ -75,7 +80,7 @@ module dma_bram #(
     always @(posedge clk) begin
         if (!resetn) begin
             st           <= IDLE;
-            dma_status   <= 32'd0;
+            dma_status   <= STATUS_IDLE;
             ptr_a        <= 32'd0;
             ptr_b        <= 32'd0;
             remaining_a  <= 32'd0;
@@ -94,7 +99,7 @@ module dma_bram #(
             if (dma_ctrl[1]) begin
                 // synchronous clear
                 st           <= IDLE;
-                dma_status   <= 32'd0;
+                dma_status   <= STATUS_IDLE;
                 a_valid      <= 1'b0;
                 b_valid      <= 1'b0;
                 a_nib_toggle <= 1'b0;
@@ -115,7 +120,7 @@ module dma_bram #(
                     if (dma_ctrl[0]) begin
                         mode_int4 <= dma_ctrl[2];
                         if (dma_addr >= DEPTH) begin
-                            dma_status <= 32'h8000_0000;
+                            dma_status <= STATUS_ERR;
                             st         <= DONE;
                         end else begin
                             clamp_space = DEPTH - dma_addr;
@@ -135,7 +140,7 @@ module dma_bram #(
                             ptr_b        <= dma_addr;
                             a_nib_toggle <= 1'b0;
                             b_nib_toggle <= 1'b0;
-                            dma_status   <= 32'd1;
+                            dma_status   <= STATUS_BUSY;
                             st           <= BUSY;
                         end
                     end
@@ -146,7 +151,7 @@ module dma_bram #(
                 // Each advances based on its own remaining counter and ready
                 // signal, so they can finish at different times.
                 BUSY: begin
-                    dma_status <= {bram_err_latch, 31'd0} | 32'd1;
+                    dma_status <= {bram_err_latch, 31'd0} | STATUS_BUSY;
 
                     // ---- A stream ----
                     if (!a_done) begin
@@ -210,7 +215,7 @@ module dma_bram #(
 
                     // Done when both streams have finished
                     if (a_done && b_done) begin
-                        dma_status <= {bram_err_latch, 31'd0} | 32'd2;
+                        dma_status <= {bram_err_latch, 31'd0} | STATUS_DONE;
                         st         <= DONE;
                     end
                 end
@@ -219,7 +224,7 @@ module dma_bram #(
                 DONE: begin
                     if (!dma_ctrl[0]) begin
                         st         <= IDLE;
-                        dma_status <= 32'd0;
+                        dma_status <= STATUS_IDLE;
                     end
                 end
                 endcase
