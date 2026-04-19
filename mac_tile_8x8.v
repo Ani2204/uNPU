@@ -131,10 +131,10 @@ module mac_tile_8x8 #(
                 wire signed [ACC_WIDTH-1:0] comb_int8_prod =
                     {{(ACC_WIDTH-16){mul8[15]}}, mul8};
 
-                // INT4: 4x4 -> 8-bit, prefer LUTs
-                (* use_dsp = "no" *)
+                // INT4: 4x4 -> 8-bit, use DSP to free LUTs
+                (* use_dsp = "yes" *)
                 wire signed [7:0] mul4_low  = signext4(A4_low)  * signext4(B4_low);
-                (* use_dsp = "no" *)
+                (* use_dsp = "yes" *)
                 wire signed [7:0] mul4_high = signext4(A4_high) * signext4(B4_high);
 
                 wire signed [ACC_WIDTH-1:0] comb_low4_prod =

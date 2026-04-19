@@ -105,61 +105,8 @@ module axi_csr_if #(
     reg [DATA_WIDTH/8-1:0]  wstrb_reg;
     reg                     write_fire_r;
 
-    always @(posedge clk) begin
-        if (!resetn) begin
-            awready <= 1'b0; aw_pending <= 1'b0;
-            awaddr_reg <= {ADDR_WIDTH{1'b0}};
-        end else begin
-            awready <= 1'b0;
-            if (!aw_pending && awvalid) begin
-                awaddr_reg <= awaddr;
-                aw_pending <= 1'b1;
-                awready    <= 1'b1;
-            end
-        end
-    end
-
-    always @(posedge clk) begin
-        if (!resetn) begin
-            wready <= 1'b0; w_pending <= 1'b0;
-            wdata_reg <= {DATA_WIDTH{1'b0}};
-            wstrb_reg <= {DATA_WIDTH/8{1'b0}};
-        end else begin
-            wready <= 1'b0;
-            if (!w_pending && wvalid) begin
-                wdata_reg <= wdata;
-                wstrb_reg <= wstrb;
-                w_pending <= 1'b1;
-                wready    <= 1'b1;
-            end
-        end
-    end
-
-    always @(posedge clk) begin
-        if (!resetn) write_fire_r <= 1'b0;
-        else         write_fire_r <= (aw_pending && w_pending);
-    end
     wire write_fire = write_fire_r;
-
-    reg resp_pending;
-    always @(posedge clk) begin
-        if (!resetn) begin
-            bvalid <= 1'b0; bresp <= 2'b00; resp_pending <= 1'b0;
-        end else begin
-            if (write_fire && !resp_pending) begin
-                bvalid       <= 1'b1;
-                bresp        <= 2'b00;
-                resp_pending <= 1'b1;
-                aw_pending   <= 1'b0;
-                w_pending    <= 1'b0;
-            end else if (resp_pending) begin
-                if (bvalid && bready) begin
-                    bvalid       <= 1'b0;
-                    resp_pending <= 1'b0;
-                end
-            end else bvalid <= 1'b0;
-        end
-    end
+    reg  resp_pending;
 
     // ----------------------------------------------------------------
     // perf_start one-cycle pulse
@@ -193,20 +140,35 @@ module axi_csr_if #(
     reg [31:0] b_emit_data;
 
     // ----------------------------------------------------------------
-    // Register writes
+    // Consolidated write channel: AXI-Lite handshake, response, and
+    // CSR register writes.  Previously spread across four always blocks
+    // which caused multi-driven-net errors on aw_pending, w_pending,
+    // and bresp (Synth 8-6859 / DRC MDRV-1).  Single always block
+    // eliminates all multiple-driver violations.
     // ----------------------------------------------------------------
     always @(posedge clk) begin
         if (!resetn) begin
-            mode_sel       <= 2'b00;   fuse_en       <= 1'b0;
-            act_sel        <= 4'd0;    bias          <= 32'd0;
-            scale          <= 4'd1;    shift         <= 4'd0;
-            gate_en        <= 1'b0;    relu_en       <= 1'b0;
-            threshold      <= 8'd0;    dyn_sched_en  <= 1'b0;
-            slice_en       <= 1'b1;    msb_stat_thres<= 4'd1;
-            systolic_en    <= 1'b0;    acc_clear     <= 1'b0;
-            dma_ctrl       <= 32'd0;   dma_addr      <= 32'd0;
+            // AW / W handshake
+            awready        <= 1'b0;    aw_pending     <= 1'b0;
+            awaddr_reg     <= {ADDR_WIDTH{1'b0}};
+            wready         <= 1'b0;    w_pending      <= 1'b0;
+            wdata_reg      <= {DATA_WIDTH{1'b0}};
+            wstrb_reg      <= {DATA_WIDTH/8{1'b0}};
+            write_fire_r   <= 1'b0;
+            // Response
+            bvalid         <= 1'b0;    bresp          <= 2'b00;
+            resp_pending   <= 1'b0;
+            // CSR defaults
+            mode_sel       <= 2'b00;   fuse_en        <= 1'b0;
+            act_sel        <= 4'd0;    bias           <= 32'd0;
+            scale          <= 4'd1;    shift          <= 4'd0;
+            gate_en        <= 1'b0;    relu_en        <= 1'b0;
+            threshold      <= 8'd0;    dyn_sched_en   <= 1'b0;
+            slice_en       <= 1'b1;    msb_stat_thres <= 4'd1;
+            systolic_en    <= 1'b0;    acc_clear      <= 1'b0;
+            dma_ctrl       <= 32'd0;   dma_addr       <= 32'd0;
             dma_len        <= 32'd0;
-
+            // BRAM emit
             a_emit_active  <= 1'b0;    b_emit_active  <= 1'b0;
             a_emit_ptr     <= 2'd0;    b_emit_ptr     <= 2'd0;
             a_emit_base    <= 16'd0;   b_emit_base    <= 16'd0;
@@ -216,6 +178,26 @@ module axi_csr_if #(
             bram_wdata_a   <= 8'd0;    bram_wdata_b   <= 8'd0;
             bram_waddr_a   <= 16'd0;   bram_waddr_b   <= 16'd0;
         end else begin
+            // ---- AW handshake ----
+            awready <= 1'b0;
+            if (!aw_pending && awvalid) begin
+                awaddr_reg <= awaddr;
+                aw_pending <= 1'b1;
+                awready    <= 1'b1;
+            end
+
+            // ---- W handshake ----
+            wready <= 1'b0;
+            if (!w_pending && wvalid) begin
+                wdata_reg <= wdata;
+                wstrb_reg <= wstrb;
+                w_pending <= 1'b1;
+                wready    <= 1'b1;
+            end
+
+            // ---- Registered write_fire ----
+            write_fire_r <= (aw_pending && w_pending);
+
             // Default: no BRAM write pulse
             bram_we_a    <= 1'b0;
             bram_we_b    <= 1'b0;
@@ -251,9 +233,13 @@ module axi_csr_if #(
                     b_emit_active <= 1'b0;
             end
 
-            // --- Process register writes ---
-            if (write_fire) begin
-                bresp <= 2'b00;
+            // ---- Response + register writes ----
+            if (write_fire && !resp_pending) begin
+                bvalid       <= 1'b1;
+                bresp        <= 2'b00;
+                resp_pending <= 1'b1;
+                aw_pending   <= 1'b0;
+                w_pending    <= 1'b0;
                 case (awaddr_reg)
                     12'h000: if (wstrb_reg[0]) mode_sel     <= wdata_reg[1:0];
                     12'h004: if (wstrb_reg[0]) fuse_en      <= wdata_reg[0];
@@ -272,9 +258,8 @@ module axi_csr_if #(
                     12'h040: if (wstrb_reg[0]) systolic_en  <= wdata_reg[0];
                     12'h044: if (wstrb_reg[0]) acc_clear    <= wdata_reg[0]; // one-cycle pulse
                     12'h060: begin
-                        // dma_ctrl: pass start/clear bits; inject INT4 from mode_sel
-                        dma_ctrl     <= wdata_reg;
-                        dma_ctrl[2]  <= (mode_sel == 2'b01);  // INT4 on bit [2]
+                        // Build dma_ctrl in one assignment; bit [2] overrides to INT4 flag
+                        dma_ctrl <= {wdata_reg[31:3], (mode_sel == 2'b01), wdata_reg[1:0]};
                     end
                     12'h064: dma_addr <= wdata_reg;
                     12'h068: dma_len  <= wdata_reg;
@@ -301,7 +286,12 @@ module axi_csr_if #(
                         end
                     end
                 endcase
-            end
+            end else if (resp_pending) begin
+                if (bvalid && bready) begin
+                    bvalid       <= 1'b0;
+                    resp_pending <= 1'b0;
+                end
+            end else bvalid <= 1'b0;
         end
     end
 

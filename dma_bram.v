@@ -60,6 +60,7 @@ module dma_bram #(
     reg        a_nib_toggle, b_nib_toggle;
     reg        a_done,       b_done;
     reg        mode_int4;
+    reg        bram_err_latch;  // sticky error bit; cleared by dma_ctrl[1] or new DMA start
 
     integer clamp_space;
 
@@ -145,7 +146,7 @@ module dma_bram #(
                 // Each advances based on its own remaining counter and ready
                 // signal, so they can finish at different times.
                 BUSY: begin
-                    dma_status <= 32'd1;
+                    dma_status <= {bram_err_latch, 31'd0} | 32'd1;
 
                     // ---- A stream ----
                     if (!a_done) begin
@@ -209,7 +210,7 @@ module dma_bram #(
 
                     // Done when both streams have finished
                     if (a_done && b_done) begin
-                        dma_status <= 32'd2;
+                        dma_status <= {bram_err_latch, 31'd0} | 32'd2;
                         st         <= DONE;
                     end
                 end
@@ -227,31 +228,36 @@ module dma_bram #(
     end
 
     // ---------------------------------------------------------------
-    // CPU BRAM preload — A memory
+    // BRAM error latch — single driver.
+    // Set when a CPU write is attempted during DMA or to an out-of-range
+    // address.  Cleared on reset, dma_ctrl[1] (software clear), or when
+    // a new DMA transfer starts (so each run begins with a clean slate).
     // ---------------------------------------------------------------
     always @(posedge clk) begin
-        if (bram_we_a) begin
-            if (st == BUSY)
-                dma_status <= dma_status | 32'h8000_0000;  // error: write during DMA
-            else if (bram_waddr_a < DEPTH)
-                mem_a[bram_waddr_a] <= bram_wdata_a;
-            else
-                dma_status <= dma_status | 32'h8000_0000;  // error: out-of-range
+        if (!resetn) begin
+            bram_err_latch <= 1'b0;
+        end else if (dma_ctrl[1] || (st == IDLE && dma_ctrl[0])) begin
+            bram_err_latch <= 1'b0;
+        end else if ((bram_we_a && (st == BUSY || bram_waddr_a >= DEPTH)) ||
+                     (bram_we_b && (st == BUSY || bram_waddr_b >= DEPTH))) begin
+            bram_err_latch <= 1'b1;
         end
+    end
+
+    // ---------------------------------------------------------------
+    // CPU BRAM preload — A memory (write only; errors tracked above)
+    // ---------------------------------------------------------------
+    always @(posedge clk) begin
+        if (bram_we_a && st != BUSY && bram_waddr_a < DEPTH)
+            mem_a[bram_waddr_a] <= bram_wdata_a;
     end
 
     // ---------------------------------------------------------------
     // CPU BRAM preload — B memory
     // ---------------------------------------------------------------
     always @(posedge clk) begin
-        if (bram_we_b) begin
-            if (st == BUSY)
-                dma_status <= dma_status | 32'h8000_0000;
-            else if (bram_waddr_b < DEPTH)
-                mem_b[bram_waddr_b] <= bram_wdata_b;
-            else
-                dma_status <= dma_status | 32'h8000_0000;
-        end
+        if (bram_we_b && st != BUSY && bram_waddr_b < DEPTH)
+            mem_b[bram_waddr_b] <= bram_wdata_b;
     end
 
 endmodule
