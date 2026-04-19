@@ -285,7 +285,7 @@ module axi_csr_if #(
                             awaddr_reg < (A_BASE + 12'd256)) begin
                             a_emit_active <= 1'b1;
                             a_emit_ptr    <= 2'd0;
-                            a_emit_base   <= {4'd0, awaddr_reg[11:0]} - 16'(A_BASE);
+                            a_emit_base   <= {4'd0, awaddr_reg[11:0]} - 16'd256;
                             a_emit_mask   <= wstrb_reg;
                             a_emit_data   <= wdata_reg;
                         // B BRAM region: 0x200..0x200+FLAT_WORDS*4-1
@@ -293,7 +293,7 @@ module axi_csr_if #(
                                      awaddr_reg < (B_BASE + 12'd256)) begin
                             b_emit_active <= 1'b1;
                             b_emit_ptr    <= 2'd0;
-                            b_emit_base   <= {4'd0, awaddr_reg[11:0]} - 16'(B_BASE);
+                            b_emit_base   <= {4'd0, awaddr_reg[11:0]} - 16'd512;
                             b_emit_mask   <= wstrb_reg;
                             b_emit_data   <= wdata_reg;
                         end else begin
