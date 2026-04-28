@@ -1,0 +1,8 @@
+sim_test
+*.vvp
+*.vcd
+*.fst
+*.lxt
+__pycache__/
+*.pyc
+*.o
